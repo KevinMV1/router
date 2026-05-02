@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Script del router</title>
+    <style>
+        * { margin:0; padding:0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1400px; margin:0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 20px; text-align: center; }
+        .input-section { margin-bottom: 20px; }
+        textarea { width: 100%; height: 300px; padding: 15px; border: 2px solid #ddd; border-radius: 5px; font-family: 'Courier New', monospace; font-size: 13px; resize: vertical; }
+        textarea:focus { outline: none; border-color: #007bff; }
+        .btn-analyze { background: #007bff; color: white; padding: 12px 40px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; display: block; margin: 20px auto; }
+        .btn-analyze:hover { background: #0056b3; }
+        .results { margin-top: 30px; }
+        .result-card { background: #f8f9fa; padding: 20px; border-radius: 5px; border-left: 4px solid #007bff; overflow-x: auto; }
+        .result-card h2 { color: #007bff; margin-bottom: 20px; font-size: 18px; text-align: center; }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; }
+        .data-table thead { background: #007bff; color: white; }
+        .data-table th { padding: 10px; text-align: left; border: 1px solid #ddd; font-weight: 600; }
+        .data-table td { padding: 8px 10px; border: 1px solid #ddd; }
+        .data-table tbody tr:hover { background: #f5f5f5; }
+        .tipo-wan { background: #ffe6e6; }
+        .tipo-lan { background: #e6f0ff; }
+        .tipo-loopback { background: #e6ffe6; }
+        .tipo-bgp { background: #fff0e6; }
+        .vlan-red { color: red; font-weight: bold; }
+        .no-data { color: #999; font-style: italic; text-align: center; padding: 20px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Configuración actual del router</h1>
+        
+        <div class="input-section">
+            <textarea id="configInput" placeholder="Pega aquí la configuración del router..."></textarea>
+        </div>
+        
+        <button class="btn-analyze" onclick="analyzeConfig()">ANALIZAR</button>
+        
+        <div id="results" class="results hidden">
+            <div class="result-card">
+                <h2>Direccionamiento IP</h2>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Tipo</th>
+                            <th>Interface</th>
+                            <th>Descripción</th>
+                            <th>IP</th>
+                            <th>Prefijo</th>
+                            <th>Máscara</th>
+                            <th>VLAN ID</th>
+                            <th>Interfaz Relacionada</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function ipToInt(ip) {
+            return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+        }
+
+        function maskToPrefix(mask) {
+            if (!mask) return 'N/A';
+            const maskInt = ipToInt(mask);
+            let prefix = 0;
+            let n = maskInt;
+            while (n) {
+                prefix += n & 1;
+                n >>>= 1;
+            }
+            return '/' + prefix;
+        }
+
+        function isSameSubnet(ip1, mask, ip2) {
+            const ip1Int = ipToInt(ip1);
+            const ip2Int = ipToInt(ip2);
+            const maskInt = ipToInt(mask);
+            return (ip1Int & maskInt) === (ip2Int & maskInt);
+        }
+
+        function analyzeConfig() {
+            const config = document.getElementById('configInput').value;
+            if (!config.trim()) {
+                alert('Por favor, pega una configuración válida');
+                return;
+            }
+
+            const results = parseConfig(config);
+            displayResults(results);
+        }
+
+        function parseConfig(config) {
+            const lines = config.split('\n');
+            const results = {
+                wanInterfaces: [],
+                lanInterfaces: [],
+                loopbackInterfaces: [],
+                bgpPeers: []
+            };
+
+            let currentInterface = null;
+            let currentBgpPeer = null;
+            let tempBgpRaw = [];
+
+            const finalizeInterface = (iface) => {
+                if (!iface || !iface.name) return;
+
+                const interfaceData = {
+                    name: iface.name,
+                    description: iface.description || 'N/A',
+                    ip: iface.ip,
+                    mask: iface.mask,
+                    vlanId: iface.vlanId || null,
+                    line: iface.line
+                };
+
+                const isLoopback = /loopback|lo\d+/i.test(iface.name);
+                const isWAN = !isLoopback && (/wan|uplink|outside|internet|public/i.test(iface.name) || 
+                             /wan|uplink|outside|internet|public/i.test(iface.description));
+                const isLAN = !isLoopback && !isWAN && (/lan|inside|local|trust|red local|privada/i.test(iface.description) || 
+                             /lan|inside|local|trust/i.test(iface.name));
+
+                if (isLoopback) {
+                    interfaceData.tipo = 'Loopback';
+                    if (!results.loopbackInterfaces.some(i => i.name === iface.name)) {
+                        results.loopbackInterfaces.push(interfaceData);
+                    }
+                } else if (isWAN) {
+                    interfaceData.tipo = 'WAN';
+                    if (!results.wanInterfaces.some(i => i.name === iface.name)) {
+                        results.wanInterfaces.push(interfaceData);
+                    }
+                } else if (isLAN) {
+                    interfaceData.tipo = 'LAN';
+                    if (!results.lanInterfaces.some(i => i.name === iface.name)) {
+                        results.lanInterfaces.push(interfaceData);
+                    }
+                }
+            };
+
+            lines.forEach((line, index) => {
+                const trimmed = line.trim();
+                if (!trimmed) return;
+
+                // Detectar interfaces (prioridad sobre BGP)
+                const interfaceMatch = trimmed.match(/^(interface|intf)\s+([^\s]+)/i);
+                if (interfaceMatch) {
+                    finalizeInterface(currentInterface);
+                    currentInterface = null;
+                    currentBgpPeer = null;
+                    
+                    const ifaceName = interfaceMatch[2];
+                    currentInterface = {
+                        name: ifaceName,
+                        description: '',
+                        ip: null,
+                        mask: null,
+                        vlanId: null,
+                        line: index + 1
+                    };
+
+                    if (ifaceName.includes('.')) {
+                        const subId = ifaceName.split('.')[1];
+                        currentInterface.vlanId = subId;
+                    }
+                    if (ifaceName.toLowerCase().startsWith('vlan')) {
+                        const vlanMatch = ifaceName.match(/vlan(\d+)/i);
+                        if (vlanMatch) currentInterface.vlanId = vlanMatch[1];
+                    }
+                    return;
+                }
+
+                // Cerrar bloque
+                if (trimmed === '}' || trimmed === 'exit' || trimmed === '!') {
+                    finalizeInterface(currentInterface);
+                    currentInterface = null;
+                    currentBgpPeer = null;
+                    return;
+                }
+
+                // Procesar interfaz actual
+                if (currentInterface) {
+                    const descMatch = trimmed.match(/^(description|desc)\s+(.+)$/i);
+                    if (descMatch) {
+                        currentInterface.description += (currentInterface.description ? ' ' : '') + descMatch[2].trim();
+                        return;
+                    }
+
+                    const ipMatch = trimmed.match(/ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)/i);
+                    if (ipMatch) {
+                        currentInterface.ip = ipMatch[1];
+                        currentInterface.mask = ipMatch[2];
+                        return;
+                    }
+
+                    const dot1qMatch = trimmed.match(/encapsulation\s+dot1[qQ]\s+(\d+)/i);
+                    if (dot1qMatch) {
+                        currentInterface.vlanId = dot1qMatch[1];
+                        return;
+                    }
+                    return; // Ignorar BGP si estamos en una interfaz
+                }
+
+                // --- Procesamiento exclusivo BGP (fuera de interfaces) ---
+                // Detectar líneas de neighbor (pueden ser peer-groups o IPs)
+                const neighborMatch = trimmed.match(/^neighbor\s+(\S+)/i);
+                if (neighborMatch) {
+                    const neighborId = neighborMatch[1];
+                    // Verificar si es una IP de peer (no peer-group)
+                    const ipMatch = neighborId.match(/^(\d+\.\d+\.\d+\.\d+)$/);
+                    if (ipMatch) {
+                        const peerIP = ipMatch[1];
+                        const entry = { peer: peerIP, line: index + 1 };
+
+                        // Capturar peer-group
+                        const peerGroupMatch = trimmed.match(/peer-group\s+(\S+)/i);
+                        if (peerGroupMatch) entry.peerGroup = peerGroupMatch[1];
+
+                        // Capturar descripción en la misma línea
+                        const descMatch = trimmed.match(/description\s+(.+)$/i);
+                        if (descMatch) entry.description = descMatch[1].trim();
+
+                        // Capturar update-source
+                        const updateSrcMatch = trimmed.match(/update-source\s+(\S+)/i);
+                        if (updateSrcMatch) entry.updateSource = updateSrcMatch[1];
+
+                        tempBgpRaw.push(entry);
+                        currentBgpPeer = peerIP;
+                    } else {
+                        // Es un peer-group, no un peer IP, ignorar para lista de peers
+                        currentBgpPeer = null;
+                    }
+                    return;
+                }
+
+                // Capturar descripción de BGP en línea separada (sin neighbor IP)
+                if (currentBgpPeer) {
+                    const bgpDescMatch = trimmed.match(/^(description|desc)\s+(.+)$/i);
+                    if (bgpDescMatch) {
+                        tempBgpRaw.push({
+                            peer: currentBgpPeer,
+                            description: bgpDescMatch[2].trim(),
+                            line: index + 1
+                        });
+                        return;
+                    }
+                }
+            });
+
+            finalizeInterface(currentInterface);
+
+            // --- Depurar y fusionar peers BGP (agrupar por IP) ---
+            const bgpPeersMap = {};
+            tempBgpRaw.forEach(entry => {
+                const ip = entry.peer;
+                if (!ip) return;
+
+                if (!bgpPeersMap[ip]) {
+                    bgpPeersMap[ip] = { 
+                        peer: ip, 
+                        description: '', 
+                        peerGroup: null, 
+                        updateSource: null, 
+                        line: entry.line 
+                    };
+                }
+
+                const existing = bgpPeersMap[ip];
+                // Fusionar descripciones
+                if (entry.description) {
+                    existing.description += (existing.description ? ' ' : '') + entry.description;
+                }
+                // Mantener peer-group
+                if (entry.peerGroup) existing.peerGroup = entry.peerGroup;
+                // Mantener update-source
+                if (entry.updateSource) existing.updateSource = entry.updateSource;
+            });
+
+            results.bgpPeers = Object.values(bgpPeersMap);
+
+            // Asociar BGP Peers con VLANs (misma subred)
+            const allInterfaces = [...results.wanInterfaces, ...results.lanInterfaces, ...results.loopbackInterfaces];
+            const vlanInterfaces = allInterfaces.filter(iface => iface.ip && iface.mask && iface.vlanId);
+
+            results.bgpPeers.forEach(peer => {
+                const matchingIface = vlanInterfaces.find(iface => 
+                    isSameSubnet(iface.ip, iface.mask, peer.peer)
+                );
+                if (matchingIface) {
+                    peer.vlanId = matchingIface.vlanId;
+                    peer.interfaceName = matchingIface.name;
+                }
+            });
+
+            return results;
+        }
+
+        function displayResults(results) {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.classList.remove('hidden');
+
+            const tableBody = document.getElementById('tableBody');
+            let html = '';
+
+            // Interfaces WAN
+            results.wanInterfaces.forEach(iface => {
+                html += `<tr class="tipo-wan">
+                    <td><strong>WAN</strong></td>
+                    <td>${iface.name}</td>
+                    <td>${iface.description}</td>
+                    <td>${iface.ip || 'N/A'}</td>
+                    <td>${iface.mask ? maskToPrefix(iface.mask) : 'N/A'}</td>
+                    <td>${iface.mask || 'N/A'}</td>
+                    <td>${iface.vlanId || 'N/A'}</td>
+                    <td>N/A</td>
+                </tr>`;
+            });
+
+            // Interfaces LAN
+            results.lanInterfaces.forEach(iface => {
+                html += `<tr class="tipo-lan">
+                    <td><strong>LAN</strong></td>
+                    <td>${iface.name}</td>
+                    <td>${iface.description}</td>
+                    <td>${iface.ip || 'N/A'}</td>
+                    <td>${iface.mask ? maskToPrefix(iface.mask) : 'N/A'}</td>
+                    <td>${iface.mask || 'N/A'}</td>
+                    <td>${iface.vlanId || 'N/A'}</td>
+                    <td>N/A</td>
+                </tr>`;
+            });
+
+            // Interfaces Loopback
+            results.loopbackInterfaces.forEach(iface => {
+                html += `<tr class="tipo-loopback">
+                    <td><strong>Loopback</strong></td>
+                    <td>${iface.name}</td>
+                    <td>${iface.description}</td>
+                    <td>${iface.ip || 'N/A'}</td>
+                    <td>${iface.mask ? maskToPrefix(iface.mask) : 'N/A'}</td>
+                    <td>${iface.mask || 'N/A'}</td>
+                    <td>${iface.vlanId || 'N/A'}</td>
+                    <td>N/A</td>
+                </tr>`;
+            });
+
+            // BGP Peers (con descripciones fusionadas)
+            results.bgpPeers.forEach(b => {
+                html += `<tr class="tipo-bgp">
+                    <td><strong>BGP Peer</strong></td>
+                    <td>${b.peer}</td>
+                    <td>${b.description || 'N/A'}</td>
+                    <td>${b.peer}</td>
+                    <td>N/A</td>
+                    <td>N/A</td>
+                    <td>${b.vlanId ? `<span class="vlan-red">${b.vlanId}</span>` : 'N/A'}</td>
+                    <td>${b.interfaceName || 'N/A'}</td>
+                </tr>`;
+            });
+
+            if (html === '') {
+                html = `<tr><td colspan="8" class="no-data">No se encontraron datos</td></tr>`;
+            }
+
+            tableBody.innerHTML = html;
+            resultsDiv.scrollIntoView({ behavior: 'smooth' });
+        }
+    </script>
+</body>
+</html>
